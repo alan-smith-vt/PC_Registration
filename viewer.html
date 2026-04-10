@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mesh Coarse Alignment</title>
+<!--
+  Serve locally:  python -m http.server 8000
+  Then open:      http://localhost:8000/viewer.html
+
+  For large meshes (>500k triangles), decimate first:
+    python decimate.py scan.ply -o scan_light.ply -t 200000
+-->
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  display: flex;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  background: #1a1a2e;
+  color: #ccd;
+}
+
+/* ── Sidebar ───────────────────────────────────────── */
+#sidebar {
+  width: 310px; min-width: 310px; height: 100vh;
+  background: #16213e; padding: 12px;
+  overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
+  border-right: 2px solid #0f3460;
+}
+#viewport { flex: 1; position: relative; }
+#viewport canvas { display: block; }
+
+h2 { font-size: 15px; color: #e94560; border-bottom: 1px solid #0f3460; padding-bottom: 6px; }
+h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #778; margin-bottom: 5px; }
+.section { background: #1a1a35; border-radius: 6px; padding: 10px; }
+label { display: block; margin: 3px 0 1px; color: #aab; font-size: 12px; }
+
+input[type="file"] { display: block; width: 100%; margin-bottom: 2px; font-size: 11px; color: #ccd; }
+input[type="file"]::file-selector-button {
+  background: #0f3460; color: #ccd; border: none; padding: 3px 8px;
+  border-radius: 3px; cursor: pointer; margin-right: 6px; font-size: 11px;
+}
+input[type="file"]::file-selector-button:hover { background: #1a4a7a; }
+
+.info { font-size: 11px; color: #7a7a9a; margin-bottom: 6px; min-height: 14px; }
+
+button {
+  background: #0f3460; border: none; color: #ccd; padding: 5px 10px;
+  border-radius: 4px; cursor: pointer; font-size: 12px; margin: 2px;
+  transition: background 0.15s;
+}
+button:hover { background: #1a4a7a; }
+button:active { background: #e94560; }
+button.active { background: #e94560; color: #fff; }
+button:disabled { opacity: 0.35; cursor: default; background: #0f3460; }
+
+.btn-row { display: flex; flex-wrap: wrap; gap: 3px; margin: 3px 0; }
+.btn-row button { flex: 1; min-width: 55px; text-align: center; }
+
+select {
+  background: #0f3460; color: #ccd; border: 1px solid #1a4a7a;
+  border-radius: 4px; padding: 4px 8px; font-size: 12px; width: 100%;
+}
+
+.pair-item {
+  background: #111; padding: 5px 6px; margin: 3px 0; border-radius: 4px;
+  font-size: 10px; font-family: 'SF Mono', Monaco, Consolas, monospace;
+  line-height: 1.4;
+}
+.pair-item .src { color: #ff6b6b; }
+.pair-item .tgt { color: #6b9fff; }
+
+#matrixDisplay {
+  font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 10px;
+  background: #111; padding: 8px; border-radius: 4px;
+  white-space: pre; overflow-x: auto; color: #8f8;
+  margin: 5px 0; line-height: 1.5;
+}
+
+.status {
+  background: #0a0a1a; padding: 5px; border-radius: 4px;
+  text-align: center; font-size: 12px; margin: 3px 0;
+  border: 2px solid transparent;
+}
+.status.picking-source { border-color: #ff6b6b; color: #ff6b6b; }
+.status.picking-target { border-color: #6b9fff; color: #6b9fff; }
+
+input[type="range"] { width: 100%; margin: 3px 0; }
+
+.shortcuts { font-size: 10px; color: #556; line-height: 1.7; }
+.shortcuts kbd {
+  background: #0f3460; padding: 1px 4px; border-radius: 3px;
+  font-family: inherit; color: #99a;
+}
+</style>
+</head>
+<body>
+
+<!-- ── Sidebar ─────────────────────────────────────────── -->
+<div id="sidebar">
+  <h2>Coarse Alignment</h2>
+
+  <div class="section">
+    <h3>Meshes</h3>
+    <label>Source (moving)</label>
+    <input type="file" id="sourceFile" accept=".ply">
+    <div class="info" id="sourceInfo">No file loaded</div>
+    <label>Target (fixed)</label>
+    <input type="file" id="targetFile" accept=".ply">
+    <div class="info" id="targetInfo">No file loaded</div>
+    <div class="btn-row">
+      <button id="centerBtn">Center View</button>
+      <button id="resetSourceBtn">Reset Source</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h3>Mode</h3>
+    <div class="btn-row" id="modeButtons">
+      <button class="active" data-mode="navigate">Navigate</button>
+      <button data-mode="moveSource">Move Src</button>
+      <button data-mode="moveTarget">Move Tgt</button>
+      <button data-mode="pick">Pick Pts</button>
+    </div>
+    <div class="btn-row" id="tfModeButtons" style="display:none">
+      <button class="active" data-tf="translate">Translate</button>
+      <button data-tf="rotate">Rotate</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h3>Point Pairs</h3>
+    <div class="status" id="pickStatus">Load both meshes to begin</div>
+    <div id="pairsList"></div>
+    <div class="btn-row">
+      <button id="undoBtn">Undo Last</button>
+      <button id="clearBtn">Clear All</button>
+    </div>
+    <label>Alignment type:</label>
+    <select id="alignMode">
+      <option value="1">1 pair &mdash; translate only</option>
+      <option value="2">2 pairs &mdash; translate + rotate</option>
+      <option value="3">3 pairs &mdash; full rigid</option>
+    </select>
+    <div class="btn-row" style="margin-top:5px">
+      <button id="alignBtn" disabled style="flex:1;background:#2a6e3f">Align</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h3>Transform</h3>
+    <div id="matrixDisplay">1.0000000000  0.0000000000  0.0000000000  0.0000000000
+0.0000000000  1.0000000000  0.0000000000  0.0000000000
+0.0000000000  0.0000000000  1.0000000000  0.0000000000
+0.0000000000  0.0000000000  0.0000000000  1.0000000000</div>
+    <div class="btn-row">
+      <button id="downloadBtn">Download .txt</button>
+      <button id="copyBtn">Copy</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h3>Display</h3>
+    <label>Source opacity</label>
+    <input type="range" id="sourceOpacity" min="0" max="1" step="0.05" value="1">
+    <label>Target opacity</label>
+    <input type="range" id="targetOpacity" min="0" max="1" step="0.05" value="0.7">
+  </div>
+
+  <div class="section">
+    <h3>Shortcuts</h3>
+    <div class="shortcuts">
+      <kbd>1</kbd> Navigate &nbsp;<kbd>2</kbd> Move Src &nbsp;<kbd>3</kbd> Move Tgt &nbsp;<kbd>4</kbd> Pick<br>
+      <kbd>T</kbd> Translate &nbsp;<kbd>R</kbd> Rotate &nbsp;<kbd>Z</kbd> Undo pick &nbsp;<kbd>Esc</kbd> Navigate<br>
+      Pick mode: <b>left-click</b> pick, <b>right-drag</b> orbit, <b>middle-drag</b> pan
+    </div>
+  </div>
+</div>
+
+<!-- ── Viewport ────────────────────────────────────────── -->
+<div id="viewport"></div>
+
+<!-- ── Three.js ────────────────────────────────────────── -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.162.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.162.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
+
+// ═══════════════════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════════════════
+let scene, camera, renderer, orbitControls, transformControls;
+let sourceMesh = null, targetMesh = null;
+let mode = 'navigate';       // navigate | moveSource | moveTarget | pick
+let tfMode = 'translate';    // translate | rotate
+let sourcePicks = [];         // Vector3[]
+let targetPicks = [];         // Vector3[]
+let markerGroup, lineGroup;
+let markerSize = 1;
+const markerGeo = new THREE.SphereGeometry(1, 14, 14);
+const srcMarkerMat = new THREE.MeshBasicMaterial({
+  color: 0xff4444, depthTest: false, transparent: true, opacity: 0.85
+});
+const tgtMarkerMat = new THREE.MeshBasicMaterial({
+  color: 0x4488ff, depthTest: false, transparent: true, opacity: 0.85
+});
+const defaultMouseButtons = {
+  LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN
+};
+const pickMouseButtons = {
+  LEFT: -1, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE
+};
+
+// DOM refs
+const viewportEl    = document.getElementById('viewport');
+const sourceInfo    = document.getElementById('sourceInfo');
+const targetInfo    = document.getElementById('targetInfo');
+const pickStatus    = document.getElementById('pickStatus');
+const pairsList     = document.getElementById('pairsList');
+const alignModeEl   = document.getElementById('alignMode');
+const alignBtn      = document.getElementById('alignBtn');
+const matrixDisplay = document.getElementById('matrixDisplay');
+
+// ═══════════════════════════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════════════════════════
+(function init() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1a1a2e);
+
+  const rect = viewportEl.getBoundingClientRect();
+  camera = new THREE.PerspectiveCamera(60, rect.width / rect.height, 0.01, 100000);
+  camera.position.set(0, 0, 100);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(rect.width, rect.height);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  viewportEl.appendChild(renderer.domElement);
+
+  // Lights
+  scene.add(new THREE.AmbientLight(0x404040, 2));
+  const d1 = new THREE.DirectionalLight(0xffffff, 1.5); d1.position.set(1, 2, 3); scene.add(d1);
+  const d2 = new THREE.DirectionalLight(0xffffff, 0.7); d2.position.set(-2, -1, -1); scene.add(d2);
+
+  // Orbit controls
+  orbitControls = new OrbitControls(camera, renderer.domElement);
+  orbitControls.enableDamping = true;
+  orbitControls.dampingFactor = 0.12;
+
+  // Transform controls (gizmo)
+  transformControls = new TransformControls(camera, renderer.domElement);
+  transformControls.addEventListener('dragging-changed', e => {
+    orbitControls.enabled = !e.value;
+  });
+  transformControls.addEventListener('objectChange', updateMatrixDisplay);
+  scene.add(transformControls);
+
+  // Marker containers
+  markerGroup = new THREE.Group(); scene.add(markerGroup);
+  lineGroup   = new THREE.Group(); scene.add(lineGroup);
+
+  // Prevent right-click context menu on canvas
+  renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+
+  // Picking via click event
+  renderer.domElement.addEventListener('click', onCanvasClick);
+
+  // File inputs
+  document.getElementById('sourceFile').addEventListener('change', e => {
+    if (e.target.files[0]) loadFile(e.target.files[0], true);
+  });
+  document.getElementById('targetFile').addEventListener('change', e => {
+    if (e.target.files[0]) loadFile(e.target.files[0], false);
+  });
+
+  // Mode buttons
+  document.querySelectorAll('#modeButtons button').forEach(btn =>
+    btn.addEventListener('click', () => setMode(btn.dataset.mode))
+  );
+  document.querySelectorAll('#tfModeButtons button').forEach(btn =>
+    btn.addEventListener('click', () => setTfMode(btn.dataset.tf))
+  );
+
+  // Action buttons
+  document.getElementById('centerBtn').addEventListener('click', centerView);
+  document.getElementById('resetSourceBtn').addEventListener('click', resetSource);
+  document.getElementById('undoBtn').addEventListener('click', undoLastPick);
+  document.getElementById('clearBtn').addEventListener('click', clearPicks);
+  alignBtn.addEventListener('click', doAlign);
+  document.getElementById('downloadBtn').addEventListener('click', downloadTransform);
+  document.getElementById('copyBtn').addEventListener('click', copyTransform);
+
+  // Opacity sliders
+  document.getElementById('sourceOpacity').addEventListener('input', e => {
+    if (sourceMesh) sourceMesh.material.opacity = parseFloat(e.target.value);
+  });
+  document.getElementById('targetOpacity').addEventListener('input', e => {
+    if (targetMesh) targetMesh.material.opacity = parseFloat(e.target.value);
+  });
+
+  // Align mode change
+  alignModeEl.addEventListener('change', updateAlignButton);
+
+  // Keyboard
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('resize', onResize);
+
+  // Render loop
+  (function animate() {
+    requestAnimationFrame(animate);
+    orbitControls.update();
+    renderer.render(scene, camera);
+  })();
+})();
+
+function onResize() {
+  const rect = viewportEl.getBoundingClientRect();
+  camera.aspect = rect.width / rect.height;
+  camera.updateProjectionMatrix();
+  renderer.setSize(rect.width, rect.height);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MESH LOADING
+// ═══════════════════════════════════════════════════════════════
+function loadFile(file, isSource) {
+  const info = isSource ? sourceInfo : targetInfo;
+  info.textContent = 'Loading ' + file.name + '...';
+
+  const reader = new FileReader();
+  reader.onprogress = e => {
+    if (e.lengthComputable) {
+      info.textContent = 'Loading... ' + (e.loaded / e.total * 100).toFixed(0) + '%';
+    }
+  };
+  reader.onload = e => {
+    try {
+      const geo = new PLYLoader().parse(e.target.result);
+      geo.computeVertexNormals();
+
+      const hasColors = geo.hasAttribute('color');
+      const mat = new THREE.MeshPhongMaterial({
+        vertexColors: hasColors,
+        color: hasColors ? 0xffffff : (isSource ? 0xe07070 : 0x7088e0),
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: isSource ? 1.0 : 0.7,
+      });
+
+      const mesh = new THREE.Mesh(geo, mat);
+
+      if (isSource) {
+        if (sourceMesh) { transformControls.detach(); scene.remove(sourceMesh); }
+        sourceMesh = mesh;
+      } else {
+        if (targetMesh) scene.remove(targetMesh);
+        targetMesh = mesh;
+      }
+      scene.add(mesh);
+
+      const nV = geo.attributes.position.count;
+      const nF = geo.index ? geo.index.count / 3 : Math.floor(nV / 3);
+      let txt = file.name + ' — ' + nV.toLocaleString() + ' verts, ' + Math.round(nF).toLocaleString() + ' faces';
+      if (nV > 2_000_000) txt += ' (large!)';
+      info.textContent = txt;
+
+      updateMarkerSize();
+      centerView();
+      clearPicks();
+      updatePickStatus();
+      updateAlignButton();
+      updateMatrixDisplay();
+    } catch (err) {
+      info.textContent = 'Error: ' + err.message;
+      console.error(err);
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  VIEW HELPERS
+// ═══════════════════════════════════════════════════════════════
+function sceneBounds() {
+  const box = new THREE.Box3();
+  if (sourceMesh) box.expandByObject(sourceMesh);
+  if (targetMesh) box.expandByObject(targetMesh);
+  return box;
+}
+
+function centerView() {
+  const box = sceneBounds();
+  if (box.isEmpty()) return;
+  const center = box.getCenter(new THREE.Vector3());
+  const size   = box.getSize(new THREE.Vector3()).length();
+
+  orbitControls.target.copy(center);
+  camera.position.copy(center).add(new THREE.Vector3(0, size * 0.3, size * 0.8));
+  camera.near = size * 0.0001;
+  camera.far  = size * 100;
+  camera.updateProjectionMatrix();
+  orbitControls.update();
+}
+
+function updateMarkerSize() {
+  const box = sceneBounds();
+  if (box.isEmpty()) return;
+  markerSize = box.getSize(new THREE.Vector3()).length() * 0.004;
+}
+
+function resetSource() {
+  if (!sourceMesh) return;
+  sourceMesh.position.set(0, 0, 0);
+  sourceMesh.quaternion.identity();
+  sourceMesh.scale.set(1, 1, 1);
+  clearPicks();
+  updateMatrixDisplay();
+  centerView();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MODE SWITCHING
+// ═══════════════════════════════════════════════════════════════
+function setMode(m) {
+  mode = m;
+
+  // Toggle orbit-controls mouse mapping
+  Object.assign(orbitControls.mouseButtons, mode === 'pick' ? pickMouseButtons : defaultMouseButtons);
+
+  // Mode button highlights
+  document.querySelectorAll('#modeButtons button').forEach(btn =>
+    btn.classList.toggle('active', btn.dataset.mode === mode)
+  );
+
+  // Show transform sub-buttons only in move modes
+  const isMove = mode === 'moveSource' || mode === 'moveTarget';
+  document.getElementById('tfModeButtons').style.display = isMove ? 'flex' : 'none';
+
+  // Attach / detach gizmo
+  transformControls.detach();
+  if (mode === 'moveSource' && sourceMesh) {
+    transformControls.attach(sourceMesh);
+    transformControls.setMode(tfMode);
+  } else if (mode === 'moveTarget' && targetMesh) {
+    transformControls.attach(targetMesh);
+    transformControls.setMode(tfMode);
+  }
+
+  renderer.domElement.style.cursor = mode === 'pick' ? 'crosshair' : 'default';
+  updatePickStatus();
+}
+
+function setTfMode(t) {
+  tfMode = t;
+  document.querySelectorAll('#tfModeButtons button').forEach(btn =>
+    btn.classList.toggle('active', btn.dataset.tf === tfMode)
+  );
+  transformControls.setMode(tfMode);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  POINT PICKING
+// ═══════════════════════════════════════════════════════════════
+function onCanvasClick(e) {
+  if (mode !== 'pick' || e.button !== 0) return;
+  if (!sourceMesh || !targetMesh) return;
+
+  const rect = renderer.domElement.getBoundingClientRect();
+  const mouse = new THREE.Vector2(
+    ((e.clientX - rect.left) / rect.width)  *  2 - 1,
+    -((e.clientY - rect.top) / rect.height) *  2 + 1,
+  );
+
+  const ray = new THREE.Raycaster();
+  ray.setFromCamera(mouse, camera);
+  const hits = ray.intersectObjects([sourceMesh, targetMesh]);
+  if (hits.length === 0) return;
+
+  const hit = hits[0];
+  const isSource = hit.object === sourceMesh;
+  const pt  = hit.point.clone();
+
+  if (isSource) {
+    if (sourcePicks.length >= 3) return;
+    sourcePicks.push(pt);
+  } else {
+    if (targetPicks.length >= 3) return;
+    targetPicks.push(pt);
+  }
+
+  rebuildMarkers();
+  updatePickStatus();
+  updateAlignButton();
+}
+
+function undoLastPick() {
+  // Remove from whichever list was most recently extended
+  if (sourcePicks.length > targetPicks.length) {
+    sourcePicks.pop();
+  } else if (targetPicks.length > 0) {
+    targetPicks.pop();
+  } else if (sourcePicks.length > 0) {
+    sourcePicks.pop();
+  }
+  rebuildMarkers();
+  updatePickStatus();
+  updateAlignButton();
+}
+
+function clearPicks() {
+  sourcePicks = [];
+  targetPicks = [];
+  rebuildMarkers();
+  updatePickStatus();
+  updateAlignButton();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  VISUAL MARKERS & PAIR LINES
+// ═══════════════════════════════════════════════════════════════
+function rebuildMarkers() {
+  clearGroup(markerGroup);
+  clearGroup(lineGroup);
+
+  sourcePicks.forEach(p => addSphere(p, true));
+  targetPicks.forEach(p => addSphere(p, false));
+
+  // Lines connecting paired points
+  const n = Math.min(sourcePicks.length, targetPicks.length);
+  for (let i = 0; i < n; i++) {
+    const geo = new THREE.BufferGeometry().setFromPoints([sourcePicks[i], targetPicks[i]]);
+    const mat = new THREE.LineBasicMaterial({ color: 0xffff44, depthTest: false, transparent: true, opacity: 0.6 });
+    const ln  = new THREE.Line(geo, mat);
+    ln.renderOrder = 998;
+    lineGroup.add(ln);
+  }
+  updatePairsListUI();
+}
+
+function addSphere(p, isSource) {
+  const s = new THREE.Mesh(markerGeo, isSource ? srcMarkerMat : tgtMarkerMat);
+  s.position.copy(p);
+  s.scale.setScalar(markerSize);
+  s.renderOrder = 999;
+  markerGroup.add(s);
+}
+
+function clearGroup(g) {
+  while (g.children.length) {
+    const c = g.children[0];
+    if (c.geometry && c.geometry !== markerGeo) c.geometry.dispose();
+    if (c.material && c.material !== srcMarkerMat && c.material !== tgtMarkerMat) c.material.dispose();
+    g.remove(c);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  UI UPDATES
+// ═══════════════════════════════════════════════════════════════
+function fmtPt(v) { return '(' + v.x.toFixed(1) + ', ' + v.y.toFixed(1) + ', ' + v.z.toFixed(1) + ')'; }
+
+function updatePairsListUI() {
+  const n = Math.min(sourcePicks.length, targetPicks.length);
+  let html = '';
+  for (let i = 0; i < n; i++) {
+    html += '<div class="pair-item"><strong>' + (i+1) + '.</strong> '
+         +  '<span class="src">S' + fmtPt(sourcePicks[i]) + '</span>'
+         +  ' &harr; '
+         +  '<span class="tgt">T' + fmtPt(targetPicks[i]) + '</span></div>';
+  }
+  // Unpaired source
+  if (sourcePicks.length > n) {
+    html += '<div class="pair-item"><strong>' + (n+1) + '.</strong> '
+         +  '<span class="src">S' + fmtPt(sourcePicks[n]) + '</span>'
+         +  ' &harr; <span class="tgt">waiting...</span></div>';
+  }
+  // Unpaired target
+  if (targetPicks.length > n) {
+    html += '<div class="pair-item"><strong>' + (n+1) + '.</strong> '
+         +  '<span class="src">waiting...</span> &harr; '
+         +  '<span class="tgt">T' + fmtPt(targetPicks[n]) + '</span></div>';
+  }
+  pairsList.innerHTML = html || '<div style="color:#445;font-size:11px;text-align:center;margin:4px 0">No points picked</div>';
+}
+
+function updatePickStatus() {
+  if (!sourceMesh || !targetMesh) {
+    pickStatus.textContent = 'Load both meshes to begin';
+    pickStatus.className = 'status';
+    return;
+  }
+  if (mode !== 'pick') {
+    pickStatus.textContent = 'Switch to Pick Pts mode (or press 4)';
+    pickStatus.className = 'status';
+    return;
+  }
+  const nPairs = Math.min(sourcePicks.length, targetPicks.length);
+  if (nPairs >= 3 && sourcePicks.length === targetPicks.length) {
+    pickStatus.textContent = 'Max 3 pairs. Align or clear.';
+    pickStatus.className = 'status';
+  } else if (sourcePicks.length <= targetPicks.length) {
+    pickStatus.textContent = 'Click SOURCE mesh for pair ' + (sourcePicks.length + 1);
+    pickStatus.className = 'status picking-source';
+  } else {
+    pickStatus.textContent = 'Click TARGET mesh for pair ' + (targetPicks.length + 1);
+    pickStatus.className = 'status picking-target';
+  }
+}
+
+function updateAlignButton() {
+  const n = Math.min(sourcePicks.length, targetPicks.length);
+  const need = parseInt(alignModeEl.value);
+  alignBtn.disabled = n < need;
+  alignBtn.textContent = 'Align (' + need + ' pair' + (need > 1 ? 's' : '') + ')';
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ALIGNMENT
+// ═══════════════════════════════════════════════════════════════
+function doAlign() {
+  const n = parseInt(alignModeEl.value);
+  if (Math.min(sourcePicks.length, targetPicks.length) < n) return;
+
+  let T;
+  if (n === 1)      T = alignOnePair(sourcePicks[0], targetPicks[0]);
+  else if (n === 2) T = alignTwoPairs(sourcePicks[0], sourcePicks[1], targetPicks[0], targetPicks[1]);
+  else              T = alignThreePairs(sourcePicks[0], sourcePicks[1], sourcePicks[2],
+                                        targetPicks[0], targetPicks[1], targetPicks[2]);
+  if (!T) return;
+
+  // new_world = T * current_world
+  sourceMesh.updateMatrixWorld(true);
+  const next = new THREE.Matrix4().multiplyMatrices(T, sourceMesh.matrixWorld);
+  const p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+  next.decompose(p, q, s);
+  sourceMesh.position.copy(p);
+  sourceMesh.quaternion.copy(q);
+  sourceMesh.scale.copy(s);
+
+  clearPicks();
+  setMode('navigate');
+  updateMatrixDisplay();
+}
+
+// ── 1 pair: pure translation ──
+function alignOnePair(sp, tp) {
+  return new THREE.Matrix4().makeTranslation(tp.x - sp.x, tp.y - sp.y, tp.z - sp.z);
+}
+
+// ── 2 pairs: translate + rotate ──
+function alignTwoPairs(s1, s2, t1, t2) {
+  const cs = s1.clone().add(s2).multiplyScalar(0.5);
+  const ct = t1.clone().add(t2).multiplyScalar(0.5);
+
+  const vs = s2.clone().sub(s1);
+  const vt = t2.clone().sub(t1);
+  if (vs.length() < 1e-10 || vt.length() < 1e-10) {
+    alert('Two of the picked points are at the same location.');
+    return null;
+  }
+  vs.normalize();
+  vt.normalize();
+
+  const quat = new THREE.Quaternion().setFromUnitVectors(vs, vt);
+  const T1 = new THREE.Matrix4().makeTranslation(-cs.x, -cs.y, -cs.z);
+  const R  = new THREE.Matrix4().makeRotationFromQuaternion(quat);
+  const T2 = new THREE.Matrix4().makeTranslation(ct.x, ct.y, ct.z);
+  return new THREE.Matrix4().copy(T2).multiply(R).multiply(T1);
+}
+
+// ── 3 pairs: full rigid (frame-based) ──
+function alignThreePairs(s1, s2, s3, t1, t2, t3) {
+  const cs = s1.clone().add(s2).add(s3).divideScalar(3);
+  const ct = t1.clone().add(t2).add(t3).divideScalar(3);
+
+  const sFrame = buildFrame(s1, s2, s3);
+  const tFrame = buildFrame(t1, t2, t3);
+  if (!sFrame || !tFrame) return null;
+
+  // R = F_target * F_source^T
+  const FsT = sFrame.clone().transpose();
+  const R   = tFrame.clone().multiply(FsT);
+  // Zero out any floating-point translation leakage
+  const re = R.elements; re[12] = re[13] = re[14] = 0;
+
+  const Rcs = cs.clone().applyMatrix4(R);
+  const t   = ct.clone().sub(Rcs);
+  const T   = R.clone();
+  T.setPosition(t);
+  return T;
+}
+
+function buildFrame(p1, p2, p3) {
+  const e1 = p2.clone().sub(p1);
+  if (e1.length() < 1e-10) { alert('Points 1 & 2 overlap.'); return null; }
+  e1.normalize();
+
+  const v  = p3.clone().sub(p1);
+  const e2 = v.sub(e1.clone().multiplyScalar(v.dot(e1)));
+  if (e2.length() < 1e-6) { alert('Points are nearly collinear.'); return null; }
+  e2.normalize();
+
+  const e3 = e1.clone().cross(e2);
+  return new THREE.Matrix4().makeBasis(e1, e2, e3);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TRANSFORM DISPLAY & EXPORT
+// ═══════════════════════════════════════════════════════════════
+function updateMatrixDisplay() {
+  if (!sourceMesh) { matrixDisplay.textContent = '(no source mesh)'; return; }
+  sourceMesh.updateMatrixWorld(true);
+  matrixDisplay.textContent = mat4Str(sourceMesh.matrixWorld);
+}
+
+function mat4Str(m) {
+  const e = m.elements;
+  // Column-major → row-major for numpy compatibility
+  const rows = [
+    [e[0], e[4], e[8],  e[12]],
+    [e[1], e[5], e[9],  e[13]],
+    [e[2], e[6], e[10], e[14]],
+    [e[3], e[7], e[11], e[15]],
+  ];
+  return rows.map(r => r.map(v => v.toFixed(10)).join('  ')).join('\n');
+}
+
+function downloadTransform() {
+  if (!sourceMesh) return;
+  sourceMesh.updateMatrixWorld(true);
+  const txt  = mat4Str(sourceMesh.matrixWorld) + '\n';
+  const blob = new Blob([txt], { type: 'text/plain' });
+  const a    = document.createElement('a');
+  a.href     = URL.createObjectURL(blob);
+  a.download = 'coarse_transform.txt';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function copyTransform() {
+  if (!sourceMesh) return;
+  sourceMesh.updateMatrixWorld(true);
+  navigator.clipboard.writeText(mat4Str(sourceMesh.matrixWorld));
+  const btn = document.getElementById('copyBtn');
+  btn.textContent = 'Copied!';
+  setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  KEYBOARD
+// ═══════════════════════════════════════════════════════════════
+function onKeyDown(e) {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  switch (e.key) {
+    case '1': setMode('navigate');   break;
+    case '2': setMode('moveSource'); break;
+    case '3': setMode('moveTarget'); break;
+    case '4': setMode('pick');       break;
+    case 't': case 'T': setTfMode('translate'); break;
+    case 'r': case 'R': setTfMode('rotate');    break;
+    case 'z': case 'Z': undoLastPick();         break;
+    case 'Escape':       setMode('navigate');   break;
+  }
+}
+</script>
+</body>
+</html>
