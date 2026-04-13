@@ -88,6 +88,19 @@ select {
 .status.picking-target { border-color: #6b9fff; color: #6b9fff; }
 
 input[type="range"] { width: 100%; margin: 3px 0; }
+input[type="number"] {
+  background: #0f3460; color: #ccd; border: 1px solid #1a4a7a;
+  border-radius: 4px; padding: 3px 6px; font-size: 12px; width: 100%;
+}
+
+#cmdDisplay {
+  font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 10px;
+  background: #111; padding: 8px; border-radius: 4px;
+  white-space: pre-wrap; word-break: break-all; color: #fd9;
+  margin: 5px 0; line-height: 1.5; cursor: pointer;
+  border: 1px solid transparent; transition: border-color 0.15s;
+}
+#cmdDisplay:hover { border-color: #fd9; }
 
 .shortcuts { font-size: 10px; color: #556; line-height: 1.7; }
 .shortcuts kbd {
@@ -158,6 +171,26 @@ input[type="range"] { width: 100%; margin: 3px 0; }
     <div class="btn-row">
       <button id="downloadBtn">Download .txt</button>
       <button id="copyBtn">Copy</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h3>Run ICP</h3>
+    <label>Source PLY path</label>
+    <input type="text" id="cmdSource" value="source.ply" style="background:#0f3460;color:#ccd;border:1px solid #1a4a7a;border-radius:4px;padding:3px 6px;font-size:12px;width:100%;margin-bottom:4px">
+    <label>Target PLY path</label>
+    <input type="text" id="cmdTarget" value="target.ply" style="background:#0f3460;color:#ccd;border:1px solid #1a4a7a;border-radius:4px;padding:3px 6px;font-size:12px;width:100%;margin-bottom:4px">
+    <label>Output path</label>
+    <input type="text" id="cmdOutput" value="merged.ply" style="background:#0f3460;color:#ccd;border:1px solid #1a4a7a;border-radius:4px;padding:3px 6px;font-size:12px;width:100%;margin-bottom:4px">
+    <label>Max points</label>
+    <input type="number" id="cmdMaxPts" value="500000" min="10000" step="50000" style="margin-bottom:4px">
+    <label>Voxel size</label>
+    <input type="number" id="cmdVoxel" value="2.0" min="0" step="0.5" style="margin-bottom:4px">
+    <label>ICP threshold</label>
+    <input type="number" id="cmdThresh" value="3.0" min="0.1" step="0.5" style="margin-bottom:6px">
+    <div id="cmdDisplay">Set paths above, then download transform first</div>
+    <div class="btn-row">
+      <button id="copyCmdBtn">Copy Command</button>
     </div>
   </div>
 
@@ -312,6 +345,12 @@ const matrixDisplay = document.getElementById('matrixDisplay');
   // Align mode change
   alignModeEl.addEventListener('change', updateAlignButton);
 
+  // Command builder — update on any input change
+  document.getElementById('copyCmdBtn').addEventListener('click', copyCommand);
+  ['cmdSource', 'cmdTarget', 'cmdOutput', 'cmdMaxPts', 'cmdVoxel', 'cmdThresh'].forEach(id => {
+    document.getElementById(id).addEventListener('input', updateCommandDisplay);
+  });
+
   // Keyboard
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('resize', onResize);
@@ -374,6 +413,10 @@ function loadFile(file, isSource) {
       let txt = file.name + ' — ' + nV.toLocaleString() + ' verts, ' + Math.round(nF).toLocaleString() + ' faces';
       if (nV > 2_000_000) txt += ' (large!)';
       info.textContent = txt;
+
+      // Auto-populate command builder with the loaded filename
+      const pathField = document.getElementById(isSource ? 'cmdSource' : 'cmdTarget');
+      pathField.value = file.name;
 
       updateMarkerSize();
       centerView();
@@ -470,11 +513,19 @@ function setTfMode(t) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  POINT PICKING
+//  POINT PICKING  (strict source → target → source → target)
 // ═══════════════════════════════════════════════════════════════
+function expectingSource() {
+  // Source goes first; after that, source is expected whenever counts are equal
+  return sourcePicks.length <= targetPicks.length;
+}
+
 function onCanvasClick(e) {
   if (mode !== 'pick' || e.button !== 0) return;
   if (!sourceMesh || !targetMesh) return;
+
+  const nPairs = Math.min(sourcePicks.length, targetPicks.length);
+  if (nPairs >= 3 && sourcePicks.length === targetPicks.length) return; // full
 
   const rect = renderer.domElement.getBoundingClientRect();
   const mouse = new THREE.Vector2(
@@ -484,20 +535,16 @@ function onCanvasClick(e) {
 
   const ray = new THREE.Raycaster();
   ray.setFromCamera(mouse, camera);
-  const hits = ray.intersectObjects([sourceMesh, targetMesh]);
-  if (hits.length === 0) return;
 
-  const hit = hits[0];
-  const isSource = hit.object === sourceMesh;
-  const pt  = hit.point.clone();
+  // Only raycast against the mesh we're expecting — the other is invisible to the ray
+  const wantSource = expectingSource();
+  const targetObj  = wantSource ? sourceMesh : targetMesh;
+  const hits = ray.intersectObject(targetObj);
+  if (hits.length === 0) return;  // missed the expected mesh, do nothing
 
-  if (isSource) {
-    if (sourcePicks.length >= 3) return;
-    sourcePicks.push(pt);
-  } else {
-    if (targetPicks.length >= 3) return;
-    targetPicks.push(pt);
-  }
+  const pt = hits[0].point.clone();
+  if (wantSource) sourcePicks.push(pt);
+  else            targetPicks.push(pt);
 
   rebuildMarkers();
   updatePickStatus();
@@ -505,11 +552,11 @@ function onCanvasClick(e) {
 }
 
 function undoLastPick() {
-  // Remove from whichever list was most recently extended
-  if (sourcePicks.length > targetPicks.length) {
-    sourcePicks.pop();
+  // Strict alternating: the last pick was the opposite of what we're expecting next
+  if (!expectingSource() && sourcePicks.length > 0) {
+    sourcePicks.pop();           // last pick was source, undo it
   } else if (targetPicks.length > 0) {
-    targetPicks.pop();
+    targetPicks.pop();           // last pick was target, undo it
   } else if (sourcePicks.length > 0) {
     sourcePicks.pop();
   }
@@ -609,11 +656,11 @@ function updatePickStatus() {
   if (nPairs >= 3 && sourcePicks.length === targetPicks.length) {
     pickStatus.textContent = 'Max 3 pairs. Align or clear.';
     pickStatus.className = 'status';
-  } else if (sourcePicks.length <= targetPicks.length) {
-    pickStatus.textContent = 'Click SOURCE mesh for pair ' + (sourcePicks.length + 1);
+  } else if (expectingSource()) {
+    pickStatus.textContent = 'Click SOURCE mesh for pair ' + (sourcePicks.length + 1) + ' (target ignored)';
     pickStatus.className = 'status picking-source';
   } else {
-    pickStatus.textContent = 'Click TARGET mesh for pair ' + (targetPicks.length + 1);
+    pickStatus.textContent = 'Click TARGET mesh for pair ' + (targetPicks.length + 1) + ' (source ignored)';
     pickStatus.className = 'status picking-target';
   }
 }
@@ -722,6 +769,7 @@ function updateMatrixDisplay() {
   if (!sourceMesh) { matrixDisplay.textContent = '(no source mesh)'; return; }
   sourceMesh.updateMatrixWorld(true);
   matrixDisplay.textContent = mat4Str(sourceMesh.matrixWorld);
+  updateCommandDisplay();
 }
 
 function mat4Str(m) {
@@ -755,6 +803,37 @@ function copyTransform() {
   const btn = document.getElementById('copyBtn');
   btn.textContent = 'Copied!';
   setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  COMMAND BUILDER
+// ═══════════════════════════════════════════════════════════════
+function buildCommand() {
+  const src    = document.getElementById('cmdSource').value.trim() || 'source.ply';
+  const tgt    = document.getElementById('cmdTarget').value.trim() || 'target.ply';
+  const out    = document.getElementById('cmdOutput').value.trim() || 'merged.ply';
+  const maxPts = document.getElementById('cmdMaxPts').value;
+  const voxel  = document.getElementById('cmdVoxel').value;
+  const thresh = document.getElementById('cmdThresh').value;
+
+  let cmd = 'python align_meshes.py "' + src + '" "' + tgt + '" \\\n'
+          + '  -o "' + out + '" \\\n'
+          + '  --initial-transform coarse_transform.txt \\\n'
+          + '  --max-points ' + maxPts + ' \\\n'
+          + '  --voxel-size ' + voxel + ' \\\n'
+          + '  --icp-threshold ' + thresh;
+  return cmd;
+}
+
+function updateCommandDisplay() {
+  document.getElementById('cmdDisplay').textContent = buildCommand();
+}
+
+function copyCommand() {
+  navigator.clipboard.writeText(buildCommand());
+  const btn = document.getElementById('copyCmdBtn');
+  btn.textContent = 'Copied!';
+  setTimeout(() => { btn.textContent = 'Copy Command'; }, 1200);
 }
 
 // ═══════════════════════════════════════════════════════════════
