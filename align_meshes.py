@@ -34,14 +34,29 @@ def load_mesh(path: str) -> o3d.geometry.TriangleMesh:
 
 
 def mesh_to_pointcloud(mesh: o3d.geometry.TriangleMesh,
-                       voxel_size: float) -> o3d.geometry.PointCloud:
-    """Convert mesh to a voxel-downsampled point cloud with normals."""
-    # Sample points proportional to surface area for uniform coverage
-    n_samples = min(len(mesh.vertices), 2_000_000)
-    pcd = mesh.sample_points_uniformly(number_of_points=n_samples)
+                       voxel_size: float,
+                       max_points: int) -> o3d.geometry.PointCloud:
+    """Convert mesh to a downsampled point cloud with normals for ICP.
+
+    Pipeline: uniform surface sample → voxel downsample → random subsample
+    to enforce the hard cap from --max-points.
+    """
+    # Sample points proportional to surface area for uniform coverage.
+    # Start with more than max_points so the voxel grid has good coverage.
+    n_surface = min(len(mesh.vertices), max(max_points * 4, 2_000_000))
+    print(f"  Sampling {n_surface:,} points from mesh surface...")
+    pcd = mesh.sample_points_uniformly(number_of_points=n_surface)
 
     if voxel_size > 0:
         pcd = pcd.voxel_down_sample(voxel_size)
+        print(f"  After voxel downsample (size={voxel_size}): {len(pcd.points):,} points")
+
+    # Hard cap: randomly subsample if still over budget
+    n = len(pcd.points)
+    if n > max_points:
+        indices = np.random.default_rng(42).choice(n, size=max_points, replace=False)
+        pcd = pcd.select_by_index(indices.tolist())
+        print(f"  Subsampled to {max_points:,} points (--max-points cap)")
 
     # Estimate normals for point-to-plane ICP
     pcd.estimate_normals(
@@ -51,7 +66,7 @@ def mesh_to_pointcloud(mesh: o3d.geometry.TriangleMesh,
         )
     )
     pcd.orient_normals_consistent_tangent_plane(k=15)
-    print(f"  Downsampled point cloud: {len(pcd.points):,} points")
+    print(f"  Final point cloud for ICP: {len(pcd.points):,} points")
     return pcd
 
 
@@ -152,6 +167,11 @@ def main():
                         help="Max correspondence distance for ICP (default: 3.0)")
     parser.add_argument("--icp-max-iter", type=int, default=200,
                         help="Max ICP iterations (default: 200)")
+    parser.add_argument("--max-points", type=int, default=500_000,
+                        help="Max points per cloud for ICP (default: 500000). "
+                             "Lower = faster but coarser. The pipeline samples "
+                             "from the mesh surface, voxel-downsamples, then "
+                             "randomly subsamples to this cap if still over.")
     parser.add_argument("--no-icp", action="store_true",
                         help="Skip ICP; only apply the initial transform.")
     parser.add_argument("--save-clouds", action="store_true",
@@ -188,8 +208,8 @@ def main():
         T_final = T_init
     else:
         print(f"\nPreparing point clouds (voxel_size={args.voxel_size})...")
-        source_pcd = mesh_to_pointcloud(source_mesh, args.voxel_size)
-        target_pcd = mesh_to_pointcloud(target_mesh, args.voxel_size)
+        source_pcd = mesh_to_pointcloud(source_mesh, args.voxel_size, args.max_points)
+        target_pcd = mesh_to_pointcloud(target_mesh, args.voxel_size, args.max_points)
 
         if args.save_clouds:
             save_pointcloud(source_pcd, "source_down.ply")
