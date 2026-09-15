@@ -770,10 +770,22 @@ function buildFrame(p1, p2, p3) {
 // ═══════════════════════════════════════════════════════════════
 //  TRANSFORM DISPLAY & EXPORT
 // ═══════════════════════════════════════════════════════════════
+// The exported transform is the SOURCE pose relative to the TARGET
+// (target⁻¹ · source), so moving either mesh in the viewer is captured.
+// With the target untouched this is just the source world matrix, as before.
+function relativeTransform() {
+  sourceMesh.updateMatrixWorld(true);
+  const m = sourceMesh.matrixWorld.clone();
+  if (targetMesh) {
+    targetMesh.updateMatrixWorld(true);
+    m.premultiply(targetMesh.matrixWorld.clone().invert());
+  }
+  return m;
+}
+
 function updateMatrixDisplay() {
   if (!sourceMesh) { matrixDisplay.textContent = '(no source mesh)'; return; }
-  sourceMesh.updateMatrixWorld(true);
-  matrixDisplay.textContent = mat4Str(sourceMesh.matrixWorld);
+  matrixDisplay.textContent = mat4Str(relativeTransform());
   updateCommandDisplay();
 }
 
@@ -791,8 +803,7 @@ function mat4Str(m) {
 
 function downloadTransform() {
   if (!sourceMesh) return;
-  sourceMesh.updateMatrixWorld(true);
-  const txt  = mat4Str(sourceMesh.matrixWorld) + '\n';
+  const txt  = mat4Str(relativeTransform()) + '\n';
   const blob = new Blob([txt], { type: 'text/plain' });
   const a    = document.createElement('a');
   a.href     = URL.createObjectURL(blob);
@@ -803,8 +814,7 @@ function downloadTransform() {
 
 function copyTransform() {
   if (!sourceMesh) return;
-  sourceMesh.updateMatrixWorld(true);
-  navigator.clipboard.writeText(mat4Str(sourceMesh.matrixWorld));
+  navigator.clipboard.writeText(mat4Str(relativeTransform()));
   const btn = document.getElementById('copyBtn');
   btn.textContent = 'Copied!';
   setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
@@ -844,7 +854,9 @@ function onImportTransform(e) {
         rows[3][0], rows[3][1], rows[3][2], rows[3][3],
       );
 
-      // Apply to source mesh
+      // Apply to source mesh. The file is source-relative-to-target, so the
+      // source world pose is target · M (just M while the target is untouched).
+      if (targetMesh) { targetMesh.updateMatrixWorld(true); m.premultiply(targetMesh.matrixWorld); }
       const p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
       m.decompose(p, q, s);
       sourceMesh.position.copy(p);
